@@ -1,0 +1,8 @@
+streamlit
+ultralytics
+opencv-python-headless
+pandas
+openpyxl
+streamlit-lottie
+requests
+easyocr
