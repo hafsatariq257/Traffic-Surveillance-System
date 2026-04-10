@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pt
+*.xlsx
+*.mp4
+*.avi
+*.mkv
+*.mov
+.streamlit/
+violations.xlsx
