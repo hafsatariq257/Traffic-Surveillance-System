@@ -1,159 +1,222 @@
+"""
+Traffic Monitoring System — Main Inference Script
+Usage:
+    python run_inference.py --source video.mp4 --model best.pt
+    python run_inference.py --source 0          # webcam
+    python run_inference.py --source video.mp4 --model best.pt --signal-red
+"""
+
+import argparse
 import cv2
-import numpy as np
-from ultralytics import YOLO
-import easyocr
 import time
-from utils.excel_logger import log_violation
- 
-reader = easyocr.Reader(['en'], gpu=False)
- 
-VEHICLE_CLASSES = {
-    2: "Car",
-    3: "Motorcycle",
-    5: "Bus",
-    7: "Truck",
-    1: "Bicycle",
-}
- 
-PIXELS_PER_METER = 8.0
-FPS = 30
- 
-class VehicleTracker:
-    def __init__(self):
-        self.tracks = {}
-        self.next_id = 0
-        self.vehicle_count = 0
-        self.counted_ids = set()
- 
-    def update(self, detections):
-        updated = {}
-        for det in detections:
-            cx, cy, cls, conf = det
-            matched_id = None
-            min_dist = 60
-            for tid, tdata in self.tracks.items():
-                dx = cx - tdata['cx']
-                dy = cy - tdata['cy']
-                dist = (dx**2 + dy**2) ** 0.5
-                if dist < min_dist:
-                    min_dist = dist
-                    matched_id = tid
-            if matched_id is None:
-                matched_id = self.next_id
-                self.next_id += 1
-                self.tracks[matched_id] = {'cx': cx, 'cy': cy, 'cls': cls, 'history': [], 'conf': conf}
-            self.tracks[matched_id]['history'].append((cx, cy, time.time()))
-            self.tracks[matched_id]['cx'] = cx
-            self.tracks[matched_id]['cy'] = cy
-            if len(self.tracks[matched_id]['history']) > 30:
-                self.tracks[matched_id]['history'].pop(0)
-            updated[matched_id] = self.tracks[matched_id]
-        self.tracks = updated
-        return self.tracks
- 
-    def get_speed(self, track_id):
-        if track_id not in self.tracks:
-            return 0
-        history = self.tracks[track_id]['history']
-        if len(history) < 2:
-            return 0
-        x1, y1, t1 = history[0]
-        x2, y2, t2 = history[-1]
-        pixel_dist = ((x2 - x1)**2 + (y2 - y1)**2) ** 0.5
-        time_diff = t2 - t1
-        if time_diff == 0:
-            return 0
-        meters = pixel_dist / PIXELS_PER_METER
-        speed_ms = meters / time_diff
-        speed_kmh = speed_ms * 3.6
-        return min(speed_kmh, 180)
- 
-    def count_vehicle(self, track_id, line_y, cy):
-        if track_id not in self.counted_ids and cy > line_y:
-            self.counted_ids.add(track_id)
-            self.vehicle_count += 1
- 
-def detect_plate_text(frame, box):
-    x1, y1, x2, y2 = box
-    h, w = frame.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return ""
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    results = reader.readtext(gray)
-    texts = [r[1] for r in results if r[2] > 0.2]
-    return " ".join(texts).strip()
- 
-def process_frame(frame, model, tracker, stop_line_y, signal_red, frame_count):
-    results = model(frame, verbose=False)[0]
-    detections = []
-    annotated = frame.copy()
-    h, w = frame.shape[:2]
- 
-    cv2.line(annotated, (0, stop_line_y), (w, stop_line_y), (0, 0, 255), 2)
-    cv2.putText(annotated, "STOP LINE", (10, stop_line_y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
- 
-    signal_color = (0, 0, 255) if signal_red else (0, 255, 0)
-    signal_text = "RED" if signal_red else "GREEN"
-    cv2.circle(annotated, (w - 50, 50), 20, signal_color, -1)
-    cv2.putText(annotated, signal_text, (w - 80, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, signal_color, 2)
- 
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        if cls_id not in VEHICLE_CLASSES:
-            continue
-        conf = float(box.conf[0])
-        if conf < 0.35:
-            continue
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        detections.append((cx, cy, cls_id, conf))
- 
-    tracks = tracker.update(detections)
-    violations_this_frame = []
- 
-    for tid, tdata in tracks.items():
-        cx, cy = tdata['cx'], tdata['cy']
-        cls_id = tdata['cls']
-        cls_name = VEHICLE_CLASSES.get(cls_id, "Vehicle")
-        speed = tracker.get_speed(tid)
-        tracker.count_vehicle(tid, stop_line_y, cy)
- 
-        color = (0, 255, 0)
-        violation_type = None
- 
-        if signal_red and cy > stop_line_y:
-            color = (0, 0, 255)
-            violation_type = "Signal Violation"
- 
-        for x1, y1, x2, y2 in [(tdata['cx']-40, tdata['cy']-40,
-                                  tdata['cx']+40, tdata['cy']+40)]:
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
- 
-        label = f"{cls_name} {speed:.0f}km/h"
-        cv2.putText(annotated, label, (cx - 40, cy - 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
- 
-        if violation_type and frame_count % 30 == 0:
-            plate = detect_plate_text(frame, (cx-60, cy-60, cx+60, cy+60))
-            log_violation(violation_type, plate, cls_name, speed)
-            violations_this_frame.append({
-                "type": violation_type,
-                "plate": plate,
-                "class": cls_name,
-                "speed": round(speed, 1)
-            })
-            cv2.putText(annotated, "VIOLATION!", (cx - 40, cy - 65),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
- 
-    cv2.putText(annotated, f"Count: {tracker.vehicle_count}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
- 
-    return annotated, tracker.vehicle_count, violations_this_frame
- 
+from datetime import datetime
+from pathlib import Path
+from ultralytics import YOLO
+
+from detector import (
+    TrackedVehicle, ViolationRecord,
+    SpeedEstimator, SignalViolationDetector,
+    NumberPlateReader, HelmetDetector,
+    VehicleCounter, ViolationLogger,
+    draw_vehicle, draw_ui,
+)
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Traffic Monitoring Inference")
+    p.add_argument("--source",      default="0",            help="Video path or 0 for webcam")
+    p.add_argument("--model",       default="best.pt",      help="YOLO model weights")
+    p.add_argument("--plate-model", default=None,           help="Number plate YOLO model (optional)")
+    p.add_argument("--helmet-model",default=None,           help="Helmet YOLO model (optional)")
+    p.add_argument("--conf",        type=float, default=0.35, help="Detection confidence threshold")
+    p.add_argument("--iou",         type=float, default=0.5,  help="NMS IOU threshold")
+    p.add_argument("--pixels-per-m",type=float, default=8.0,  help="Calibration: pixels per metre")
+    p.add_argument("--stop-line",   type=int,   default=None, help="Stop-line Y pixel (auto = 40% height)")
+    p.add_argument("--count-line",  type=int,   default=None, help="Count-line Y pixel (auto = 60% height)")
+    p.add_argument("--signal-red",  action="store_true",    help="Start with signal RED")
+    p.add_argument("--save-video",  action="store_true",    help="Save annotated output video")
+    p.add_argument("--output-dir",  default="outputs",      help="Directory for outputs")
+    return p.parse_args()
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    # ── Load models ──────────────────────────────────────────────────────────
+    print("Loading YOLOv8 model …")
+    model = YOLO(args.model)
+    model.fuse()
+
+    plate_reader  = NumberPlateReader(args.plate_model)
+    helmet_det    = HelmetDetector(args.helmet_model)
+
+    # ── Open video ───────────────────────────────────────────────────────────
+    source = int(args.source) if args.source.isdigit() else args.source
+    cap    = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open source '{args.source}'")
+        return
+
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Video: {width}x{height} @ {fps:.1f} fps")
+
+    # ── Auto-set line positions ───────────────────────────────────────────────
+    stop_line_y  = args.stop_line  or int(height * 0.40)
+    count_line_y = args.count_line or int(height * 0.65)
+
+    # ── Init components ───────────────────────────────────────────────────────
+    speed_est   = SpeedEstimator(fps, pixels_per_meter=args.pixels_per_m)
+    sig_det     = SignalViolationDetector(stop_line_y, signal_red=args.signal_red)
+    counter     = VehicleCounter(count_line_y)
+
+    output_dir  = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger      = ViolationLogger(str(output_dir / f"violations_{ts}.xlsx"))
+
+    # ── Video writer ──────────────────────────────────────────────────────────
+    writer = None
+    if args.save_video:
+        out_path = str(output_dir / f"annotated_{ts}.mp4")
+        fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
+        writer   = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+
+    # ── Track state ──────────────────────────────────────────────────────────
+    vehicles: dict[int, TrackedVehicle] = {}
+    frame_num   = 0
+    signal_red  = args.signal_red
+
+    print("\nRunning inference … Press 'q' to quit, 'r' to toggle signal RED/GREEN\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_num += 1
+        t_start = time.time()
+
+        # ── YOLOv8 tracking ──────────────────────────────────────────────────
+        results = model.track(
+            frame,
+            imgsz       = 640,
+            conf        = args.conf,
+            iou         = args.iou,
+            persist     = True,
+            tracker     = "bytetrack.yaml",
+            verbose     = False,
+        )
+
+        active_ids = set()
+
+        if results[0].boxes is not None and results[0].boxes.id is not None:
+            boxes   = results[0].boxes.xyxy.cpu().numpy()
+            cls_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+            ids     = results[0].boxes.id.cpu().numpy().astype(int)
+
+            for bbox, cls_id, track_id in zip(boxes, cls_ids, ids):
+                cls_name = model.names[cls_id]
+                cx = int((bbox[0] + bbox[2]) / 2)
+                cy = int((bbox[1] + bbox[3]) / 2)
+
+                # Create or update tracked vehicle
+                if track_id not in vehicles:
+                    vehicles[track_id] = TrackedVehicle(
+                        track_id   = track_id,
+                        class_name = cls_name,
+                        bbox       = bbox,
+                        centroid   = (cx, cy),
+                    )
+                else:
+                    vehicles[track_id].bbox     = bbox
+                    vehicles[track_id].centroid = (cx, cy)
+                    vehicles[track_id].last_seen = time.time()
+
+                v = vehicles[track_id]
+                active_ids.add(track_id)
+
+                # Speed
+                speed_est.update(v)
+
+                # Counting
+                counter.update(v)
+
+                # Signal violation
+                if sig_det.check(v):
+                    ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    # Read plate for violator
+                    v.plate_text = plate_reader.read(frame, v.bbox)
+
+                    record = ViolationRecord(
+                        timestamp   = ts_now,
+                        track_id    = track_id,
+                        vehicle_cls = cls_name,
+                        plate_text  = v.plate_text,
+                        speed_kmh   = v.speed_kmh,
+                        violation   = "Signal Violation",
+                    )
+                    logger.log(record)
+                    print(f"  ⚠ VIOLATION | ID:{track_id} | {cls_name} | "
+                          f"Plate:{v.plate_text or 'N/A'} | {v.speed_kmh:.0f} km/h")
+
+                # Helmet (every 10 frames to save CPU)
+                if frame_num % 10 == 0:
+                    v.has_helmet = helmet_det.detect(frame, v.bbox, cls_name)
+                    if not v.has_helmet and not v.violated:
+                        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        v.plate_text = v.plate_text or plate_reader.read(frame, v.bbox)
+                        record = ViolationRecord(
+                            timestamp   = ts_now,
+                            track_id    = track_id,
+                            vehicle_cls = cls_name,
+                            plate_text  = v.plate_text,
+                            speed_kmh   = v.speed_kmh,
+                            violation   = "No Helmet",
+                        )
+                        logger.log(record)
+
+                draw_vehicle(frame, v, signal_red)
+
+        # ── Draw UI overlay ───────────────────────────────────────────────────
+        sig_det.set_signal(signal_red)
+        draw_ui(frame, counter, signal_red, stop_line_y, count_line_y)
+
+        # FPS display
+        elapsed = time.time() - t_start
+        fps_disp = 1.0 / (elapsed + 1e-6)
+        cv2.putText(frame, f"FPS: {fps_disp:.1f}", (width - 100, height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        if writer:
+            writer.write(frame)
+
+        cv2.imshow("Traffic Monitoring System", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            signal_red = not signal_red
+            print(f"  Signal toggled → {'RED' if signal_red else 'GREEN'}")
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    cap.release()
+    if writer:
+        writer.release()
+    cv2.destroyAllWindows()
+    logger.save()
+
+    print(f"\nDone. Violations saved to: {logger.path}")
+    print(f"Total vehicles counted: {counter.total}")
+    for cls, cnt in counter.counts.items():
+        print(f"  {cls}: {cnt}")
+
+
+if __name__ == "__main__":
+    main()
